@@ -6,6 +6,9 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.nn import functional as F
+
+from ultralytics.nn.tasks import DetectionModel
 
 
 def _finite_real(name: str, value: Real) -> float:
@@ -81,3 +84,110 @@ class DomainClassifier(nn.Module):
         if features.shape[1] != self.in_channels:
             raise ValueError(f'expected {self.in_channels} P5 channels, received {features.shape[1]}')
         return self.classifier(features)
+
+
+class DANNDetectionModel(DetectionModel):
+    def __init__(
+        self,
+        cfg='yolov8n.yaml',
+        ch=3,
+        nc=None,
+        verbose=True,
+        *,
+        p5_layer=31,
+        domain_hidden=256,
+        domain_dropout=0.1,
+        domain_loss_gain=1.0,
+    ) -> None:
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+        if p5_layer != 31:
+            raise ValueError('the first DANN version requires p5_layer=31')
+        domain_loss_gain = _finite_real('domain_loss_gain', domain_loss_gain)
+        if domain_loss_gain < 0.0:
+            raise ValueError('domain_loss_gain must be non-negative')
+        self.p5_layer = p5_layer
+        self.domain_loss_gain = domain_loss_gain
+        p5_channels = self.model[-1].cv2[-1][0].conv.in_channels
+        self.grl = GradientReversalLayer()
+        self.domain_classifier = DomainClassifier(p5_channels, domain_hidden, domain_dropout)
+
+    def forward_with_p5(self, images: torch.Tensor):
+        y = []
+        p5 = None
+        output = images
+        for module in self.model:
+            if module.f != -1:
+                output = y[module.f] if isinstance(module.f, int) else [output if j == -1 else y[j] for j in module.f]
+            output = module(output)
+            if module.i == self.p5_layer:
+                p5 = output
+            y.append(output if module.i in self.save else None)
+        if p5 is None:
+            raise RuntimeError(f'P5 layer {self.p5_layer} was not executed')
+        return output, p5
+
+    @staticmethod
+    def _validate_domain_images(source: torch.Tensor, target: torch.Tensor) -> None:
+        if not isinstance(source, torch.Tensor) or not isinstance(target, torch.Tensor):
+            raise TypeError('source and target images must be tensors')
+        if source.ndim != 4 or target.ndim != 4 or source.shape[0] == 0 or target.shape[0] == 0:
+            raise ValueError('source and target images must be non-empty 4D tensors')
+        if source.shape[1:] != target.shape[1:]:
+            raise ValueError('source and target images must have matching non-batch shapes')
+        if source.device != target.device or source.dtype != target.dtype:
+            raise ValueError('source and target images must share device and dtype')
+
+    @staticmethod
+    def _source_predictions(predictions, source_batch_size: int):
+        if not isinstance(predictions, (list, tuple)) or not predictions:
+            raise TypeError('training Detect predictions must be a non-empty list or tuple')
+        if not all(isinstance(feature, torch.Tensor) for feature in predictions):
+            raise TypeError('every Detect prediction must be a tensor')
+        return [feature[:source_batch_size] for feature in predictions]
+
+    @staticmethod
+    def _source_batch(batch: dict) -> dict:
+        return {
+            key: value
+            for key, value in batch.items()
+            if not key.startswith('target_') and key not in {'dann_enabled', 'dann_lambda'}
+        }
+
+    def loss(self, batch, preds=None):
+        if 'target_img' not in batch:
+            return super().loss(batch, preds=preds)
+        if preds is not None:
+            raise ValueError('precomputed predictions are not supported for mixed-domain loss')
+        if getattr(self, 'criterion', None) is None:
+            self.criterion = self.init_criterion()
+
+        source_images = batch['img']
+        target_images = batch['target_img']
+        self._validate_domain_images(source_images, target_images)
+        source_batch_size = source_images.shape[0]
+        predictions, p5 = self.forward_with_p5(torch.cat((source_images, target_images), dim=0))
+        source_predictions = self._source_predictions(predictions, source_batch_size)
+        detection_loss, detection_items = self.criterion(source_predictions, self._source_batch(batch))
+
+        enabled = batch.get('dann_enabled', True)
+        coefficient = _finite_real('dann_lambda', batch.get('dann_lambda', 1.0))
+        if not 0.0 <= coefficient <= 1.0:
+            raise ValueError('dann_lambda must be within [0, 1]')
+        if not isinstance(enabled, bool):
+            raise TypeError('dann_enabled must be a bool')
+        if not enabled:
+            return detection_loss, torch.cat((detection_items, detection_items.new_zeros(3)))
+
+        target_batch_size = target_images.shape[0]
+        domain_labels = torch.cat(
+            (
+                torch.zeros(source_batch_size, dtype=torch.long, device=p5.device),
+                torch.ones(target_batch_size, dtype=torch.long, device=p5.device),
+            )
+        )
+        domain_logits = self.domain_classifier(self.grl(p5, coefficient))
+        domain_loss = F.cross_entropy(domain_logits, domain_labels)
+        domain_accuracy = (domain_logits.argmax(dim=1) == domain_labels).float().mean()
+        total_loss = detection_loss + self.domain_loss_gain * domain_loss * source_batch_size
+        metrics = detection_items.new_tensor((domain_loss.detach(), domain_accuracy.detach(), coefficient))
+        return total_loss, torch.cat((detection_items, metrics))
