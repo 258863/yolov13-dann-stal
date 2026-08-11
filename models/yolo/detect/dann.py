@@ -155,7 +155,8 @@ class DANNDetectionModel(DetectionModel):
 
     def loss(self, batch, preds=None):
         if 'target_img' not in batch:
-            return super().loss(batch, preds=preds)
+            detection_loss, detection_items = super().loss(batch, preds=preds)
+            return detection_loss, torch.cat((detection_items, detection_items.new_zeros(3)))
         if preds is not None:
             raise ValueError('precomputed predictions are not supported for mixed-domain loss')
         if getattr(self, 'criterion', None) is None:

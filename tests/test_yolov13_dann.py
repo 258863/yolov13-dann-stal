@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
 
 from ultralytics.models.yolo.detect.dann import DANNDetectionModel, DomainClassifier, dann_lambda, gradient_reverse
+from ultralytics.models.yolo.detect.train_dann import DANNDetectionTrainer, validate_dann_config
+from ultralytics.nn.tasks import DetectionModel
+from ultralytics.scripts import train_yolov13_dann
+from ultralytics.scripts.train_yolov13_dann import build_trainer, load_experiment_config, select_trainer
 
 
 class RecordingCriterion:
@@ -153,6 +160,18 @@ def test_dann_loss_sends_only_source_predictions_to_detection_criterion() -> Non
     assert torch.equal(items[3:], torch.zeros(3))
 
 
+def test_source_only_validation_loss_keeps_six_metric_slots() -> None:
+    model = make_detection_model().train()
+    model.criterion = RecordingCriterion()
+    predictions = [torch.randn(1, 4, size, size) for size in (8, 4, 2)]
+
+    loss, items = model.loss({'img': torch.randn(1, 3, 64, 64)}, preds=predictions)
+
+    assert loss.shape == ()
+    assert items.shape == (6,)
+    assert torch.equal(items[3:], torch.zeros(3))
+
+
 def test_dann_loss_validates_mixed_image_shapes() -> None:
     model = make_detection_model().train()
     model.criterion = RecordingCriterion()
@@ -202,3 +221,226 @@ def test_dann_loss_backpropagates_domain_and_backbone_gradients() -> None:
     assert model.domain_classifier.classifier[-1].weight.grad is not None
     assert model.model[0].conv.weight.grad is not None
     assert torch.isfinite(model.model[0].conv.weight.grad).all()
+
+
+def test_validate_dann_config_applies_defaults() -> None:
+    config = validate_dann_config({'target_data': 'target.yaml', 'experiment': 'e1'})
+
+    assert config['target_batch'] is None
+    assert config['p5_layer'] == 31
+    assert config['domain_hidden'] == 256
+    assert config['domain_loss_gain'] == pytest.approx(1.0)
+    assert config['lambda_max'] == pytest.approx(1.0)
+    assert config['gamma'] == pytest.approx(10.0)
+
+
+@pytest.mark.parametrize(
+    'updates',
+    [
+        {},
+        {'target_data': 'target.yaml', 'experiment': 'e0'},
+        {'target_data': 'target.yaml', 'experiment': 'e1', 'p5_layer': 27},
+        {'target_data': 'target.yaml', 'experiment': 'e1', 'target_batch': 0},
+        {'target_data': 'target.yaml', 'experiment': 'e1', 'lambda_max': 1.1},
+    ],
+)
+def test_validate_dann_config_rejects_invalid_values(updates) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        validate_dann_config(updates)
+
+
+def make_trainer_without_init(experiment='e1') -> DANNDetectionTrainer:
+    trainer = object.__new__(DANNDetectionTrainer)
+    trainer.device = torch.device('cpu')
+    trainer.args = SimpleNamespace(multi_scale=False, imgsz=64)
+    trainer.dann_config = validate_dann_config({'target_data': 'target.yaml', 'experiment': experiment})
+    trainer.target_loader = [{'img': torch.full((1, 3, 32, 32), 255, dtype=torch.uint8)}]
+    trainer._target_iterator = iter(trainer.target_loader)
+    trainer._target_epoch = None
+    trainer.train_loader = [None, None]
+    trainer.epochs = 2
+    trainer.epoch = 0
+    trainer.start_epoch = 0
+    trainer._dann_step = 0
+    return trainer
+
+
+def test_trainer_cycles_target_batches_and_matches_source_shape() -> None:
+    trainer = make_trainer_without_init()
+    source = {'img': torch.zeros(1, 3, 64, 64, dtype=torch.uint8), 'cls': torch.zeros(0, 1)}
+
+    first = trainer.preprocess_batch(source.copy())
+    second = trainer.preprocess_batch(source.copy())
+
+    assert first['img'].shape == first['target_img'].shape
+    assert second['target_img'].shape == second['img'].shape
+    assert torch.all(first['target_img'] == 1.0)
+    assert first['dann_enabled'] is True
+    assert first['dann_lambda'] == pytest.approx(0.0)
+    assert second['dann_lambda'] > first['dann_lambda']
+    assert 'target_cls' not in first
+
+
+def test_e05_trainer_disables_domain_objective_but_keeps_target_images() -> None:
+    trainer = make_trainer_without_init(experiment='e05')
+
+    batch = trainer.preprocess_batch({'img': torch.zeros(1, 3, 64, 64, dtype=torch.uint8)})
+
+    assert batch['target_img'].shape == batch['img'].shape
+    assert batch['dann_enabled'] is False
+
+
+@pytest.mark.parametrize(('experiment', 'requires_grad'), [('e05', False), ('e1', True)])
+def test_trainer_disables_unused_domain_parameters_for_e05_ddp(experiment, requires_grad) -> None:
+    trainer = object.__new__(DANNDetectionTrainer)
+    trainer.data = {'nc': 2}
+    trainer.dann_config = validate_dann_config({'target_data': 'target.yaml', 'experiment': experiment})
+
+    model = trainer.get_model('cfg/models/v13/yolov13.yaml', verbose=False)
+
+    assert all(parameter.requires_grad is requires_grad for parameter in model.domain_classifier.parameters())
+
+
+def test_select_trainer_keeps_e0_on_original_trainer() -> None:
+    from ultralytics.models.yolo.detect.train import DetectionTrainer
+
+    assert select_trainer('e0') is DetectionTrainer
+    assert select_trainer('e05') is DANNDetectionTrainer
+    assert select_trainer('e1') is DANNDetectionTrainer
+
+
+def test_load_experiment_config_separates_upstream_and_dann_keys(tmp_path: Path) -> None:
+    config_path = tmp_path / 'experiment.yaml'
+    config_path.write_text(
+        'experiment: e1\n'
+        'source_data: source.yaml\n'
+        'target_data: target.yaml\n'
+        'model: cfg/models/v13/yolov13.yaml\n'
+        'weights: weights.pt\n'
+        'train:\n  epochs: 3\n  batch: 2\n'
+        'dann:\n  domain_hidden: 16\n',
+        encoding='utf-8',
+    )
+
+    overrides, dann_config = load_experiment_config(config_path)
+
+    assert overrides['data'] == 'source.yaml'
+    assert overrides['model'] == 'cfg/models/v13/yolov13.yaml'
+    assert overrides['pretrained'] == 'weights.pt'
+    assert 'dann' not in overrides
+    assert dann_config['target_data'] == 'target.yaml'
+    assert dann_config['domain_hidden'] == 16
+
+
+def test_load_experiment_config_rejects_missing_source(tmp_path: Path) -> None:
+    config_path = tmp_path / 'experiment.yaml'
+    config_path.write_text('experiment: e0\nmodel: cfg/models/v13/yolov13.yaml\n', encoding='utf-8')
+
+    with pytest.raises(ValueError, match='source_data'):
+        load_experiment_config(config_path)
+
+
+def test_build_trainer_routes_e0_without_dann_arguments(tmp_path: Path, monkeypatch) -> None:
+    calls = []
+
+    class FakeDetectionTrainer:
+        def __init__(self, **kwargs) -> None:
+            calls.append(kwargs)
+
+    monkeypatch.setattr(train_yolov13_dann, 'DetectionTrainer', FakeDetectionTrainer)
+    config_path = tmp_path / 'e0.yaml'
+    config_path.write_text(
+        'experiment: e0\nsource_data: source.yaml\nmodel: cfg/models/v13/yolov13.yaml\n', encoding='utf-8'
+    )
+
+    trainer = build_trainer(config_path)
+
+    assert isinstance(trainer, FakeDetectionTrainer)
+    assert set(calls[0]) == {'overrides'}
+
+
+@pytest.mark.parametrize(('enabled', 'expect_domain_gradient'), [(False, False), (True, True)])
+def test_real_detection_loss_backward_smoke(enabled, expect_domain_gradient) -> None:
+    torch.manual_seed(4)
+    model = make_detection_model(domain_dropout=0.0).train()
+    model.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5)
+    batch = {
+        'img': torch.randn(1, 3, 64, 64),
+        'target_img': torch.randn(1, 3, 64, 64) + 1.0,
+        'batch_idx': torch.tensor([0]),
+        'cls': torch.tensor([[1.0]]),
+        'bboxes': torch.tensor([[0.5, 0.5, 0.2, 0.2]]),
+        'dann_enabled': enabled,
+        'dann_lambda': 0.5,
+    }
+
+    loss, items = model.loss(batch)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(items).all()
+    assert model.model[0].conv.weight.grad is not None
+    assert torch.isfinite(model.model[0].conv.weight.grad).all()
+    classifier_gradient = model.domain_classifier.classifier[-1].weight.grad
+    assert (classifier_gradient is not None) is expect_domain_gradient
+
+
+def test_dann_training_path_does_not_change_inference_contract() -> None:
+    torch.manual_seed(5)
+    model = make_detection_model(domain_dropout=0.0).eval()
+    image = torch.randn(1, 3, 64, 64)
+    with torch.no_grad():
+        before = model(image)
+
+    model.train()
+    for module in model.modules():
+        if isinstance(module, nn.modules.batchnorm._BatchNorm):
+            module.eval()
+    model.criterion = RecordingCriterion()
+    model.loss(
+        {
+            'img': torch.randn(1, 3, 64, 64),
+            'target_img': torch.randn(1, 3, 64, 64),
+            'dann_enabled': True,
+            'dann_lambda': 0.5,
+        }
+    )
+    model.eval()
+    with torch.no_grad():
+        after = model(image)
+
+    assert_nested_close(after, before)
+
+
+def test_onnx_export_excludes_training_only_domain_branch(tmp_path: Path) -> None:
+    onnx = pytest.importorskip('onnx', reason='onnx is required to inspect the exported graph contract')
+    baseline = DetectionModel('cfg/models/v13/yolov13.yaml', nc=2, verbose=False).eval()
+    dann = make_detection_model(domain_dropout=0.0).eval()
+    graphs = []
+
+    for name, model in (('baseline', baseline), ('dann', dann)):
+        head = model.model[-1]
+        head.export = True
+        head.format = 'onnx'
+        head.dynamic = False
+        path = tmp_path / f'{name}.onnx'
+        torch.onnx.export(
+            model,
+            torch.randn(1, 3, 64, 64),
+            path,
+            opset_version=17,
+            input_names=['images'],
+            output_names=['output0'],
+        )
+        graphs.append(onnx.load(path))
+
+    baseline_graph, dann_graph = (model.graph for model in graphs)
+    assert len(dann_graph.input) == 1
+    assert len(dann_graph.output) == len(baseline_graph.output)
+    assert [dim.dim_value for dim in dann_graph.output[0].type.tensor_type.shape.dim] == [
+        dim.dim_value for dim in baseline_graph.output[0].type.tensor_type.shape.dim
+    ]
+    initializer_names = [initializer.name.lower() for initializer in dann_graph.initializer]
+    node_names = [node.name.lower() for node in dann_graph.node]
+    assert not any('domain_classifier' in name for name in initializer_names)
+    assert not any('domain_classifier' in name or 'gradientreversal' in name for name in node_names)

@@ -2,6 +2,7 @@
 
 from .predict import DetectionPredictor
 from .train import DetectionTrainer
+from .train_dann import DANNDetectionTrainer
 from .val import DetectionValidator
 
-__all__ = "DetectionPredictor", "DetectionTrainer", "DetectionValidator"
+__all__ = 'DANNDetectionTrainer', 'DetectionPredictor', 'DetectionTrainer', 'DetectionValidator'
