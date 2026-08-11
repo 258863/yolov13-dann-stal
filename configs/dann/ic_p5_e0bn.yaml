@@ -1,0 +1,20 @@
+# E0-BN: 16 Source images forward once; only the first 8 receive detection supervision.
+experiment: e0bn
+source_data: D:/datasets/ic_source/data.yaml
+model: cfg/models/v13/yolov13.yaml
+weights: null
+
+train:
+  epochs: 100
+  imgsz: 640
+  batch: 8
+  device: 0
+
+dann:
+  supervised_batch: 8
+  p5_layer: 31
+  domain_hidden: 256
+  domain_dropout: 0.1
+  domain_loss_gain: 1.0
+  lambda_max: 1.0
+  gamma: 10.0

@@ -15,7 +15,9 @@ from ultralytics.utils import LOCAL_RANK, RANK
 
 
 DEFAULT_DANN_CONFIG = {
+    'target_data': None,
     'target_batch': None,
+    'supervised_batch': None,
     'p5_layer': 31,
     'domain_hidden': 256,
     'domain_dropout': 0.1,
@@ -39,10 +41,13 @@ def validate_dann_config(config):
     if not isinstance(config, dict):
         raise TypeError('dann_config must be a dictionary')
     merged = {**DEFAULT_DANN_CONFIG, **config}
-    if not isinstance(merged.get('target_data'), (str, bytes)) or not merged['target_data']:
+    experiment = merged.get('experiment')
+    if experiment not in {'e0bn', 'e05', 'e1'}:
+        raise ValueError('experiment must be e0bn, e05, or e1 for DANNDetectionTrainer')
+    if experiment in {'e05', 'e1'} and (
+        not isinstance(merged['target_data'], (str, bytes)) or not merged['target_data']
+    ):
         raise ValueError('target_data is required')
-    if merged.get('experiment') not in {'e05', 'e1'}:
-        raise ValueError('experiment must be e05 or e1 for DANNDetectionTrainer')
     if merged['p5_layer'] != 31:
         raise ValueError('p5_layer must be 31 in the first DANN version')
     for name in ('domain_hidden',):
@@ -53,6 +58,13 @@ def validate_dann_config(config):
         not isinstance(target_batch, int) or isinstance(target_batch, bool) or target_batch <= 0
     ):
         raise ValueError('target_batch must be a positive integer or null')
+    supervised_batch = merged['supervised_batch']
+    if supervised_batch is not None and (
+        not isinstance(supervised_batch, int) or isinstance(supervised_batch, bool) or supervised_batch <= 0
+    ):
+        raise ValueError('supervised_batch must be a positive integer or null')
+    if experiment == 'e0bn' and supervised_batch is None:
+        raise ValueError('supervised_batch is required for e0bn')
     dropout = _finite_number('domain_dropout', merged['domain_dropout'])
     gain = _finite_number('domain_loss_gain', merged['domain_loss_gain'])
     lambda_max = _finite_number('lambda_max', merged['lambda_max'])
@@ -113,6 +125,20 @@ class DANNDetectionTrainer(DetectionTrainer):
             model.load(weights)
         return model
 
+    def get_dataloader(self, dataset_path, batch_size=16, rank=0, mode='train'):
+        e0bn_train = self.dann_config['experiment'] == 'e0bn' and mode == 'train'
+        loader = super().get_dataloader(
+            dataset_path, batch_size=batch_size * 2 if e0bn_train else batch_size, rank=rank, mode=mode
+        )
+        if e0bn_train:
+            batch_sampler = getattr(getattr(loader, 'batch_sampler', None), 'sampler', None)
+            if batch_sampler is None or not hasattr(batch_sampler, 'drop_last'):
+                raise TypeError('e0bn requires a mutable batch sampler with drop_last support')
+            batch_sampler.drop_last = True
+            if hasattr(loader, 'reset'):
+                loader.reset()
+        return loader
+
     def _build_target_loader(self, target_data, target_batch):
         source_data = self.data
         try:
@@ -133,6 +159,14 @@ class DANNDetectionTrainer(DetectionTrainer):
 
     def _setup_train(self, world_size):
         super()._setup_train(world_size)
+        if self.dann_config['experiment'] == 'e0bn':
+            supervised_batch = self._target_batch_per_rank(self.dann_config['supervised_batch'], world_size)
+            optimizer_batch = self.batch_size // max(world_size, 1)
+            if optimizer_batch != supervised_batch:
+                raise ValueError('e0bn requires train batch to equal supervised_batch')
+            self._e0bn_supervised_batch = supervised_batch
+            self._dann_step = self.start_epoch * len(self.train_loader)
+            return
         target_data = check_det_dataset(self.dann_config['target_data'])
         target_batch = self.dann_config['target_batch'] or self.batch_size
         target_batch = self._target_batch_per_rank(target_batch, world_size)
@@ -161,6 +195,25 @@ class DANNDetectionTrainer(DetectionTrainer):
 
     def preprocess_batch(self, batch):
         batch = super().preprocess_batch(batch)
+        if self.dann_config['experiment'] == 'e0bn':
+            images = batch['img']
+            supervised_batch = self._e0bn_supervised_batch
+            if images.shape[0] != 2 * supervised_batch:
+                raise ValueError('e0bn batches must contain exactly 2 * supervised_batch images')
+            batch_indices = batch.get('batch_idx')
+            if not isinstance(batch_indices, torch.Tensor):
+                raise TypeError('e0bn batches must contain tensor batch_idx annotations')
+            supervised_targets = batch_indices < supervised_batch
+            for key in ('batch_idx', 'cls', 'bboxes'):
+                value = batch.get(key)
+                if not isinstance(value, torch.Tensor) or value.shape[0] != supervised_targets.shape[0]:
+                    raise ValueError(f'e0bn annotation tensor {key} must align with batch_idx')
+                batch[key] = value[supervised_targets]
+            batch['img'] = images[:supervised_batch]
+            batch['target_img'] = images[supervised_batch:]
+            batch['dann_enabled'] = False
+            batch['dann_lambda'] = 0.0
+            return batch
         target_batch = self._next_target_batch()
         if 'img' not in target_batch:
             raise KeyError('target batches must contain img')

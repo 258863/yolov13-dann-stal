@@ -15,7 +15,7 @@ Add a control experiment that separates the effect of a 16-image forward/BatchNo
 
 ## Data Path
 
-E0-BN uses one Source training loader with a physical batch size of 16. After normal YOLO preprocessing and augmentation, the trainer splits the batch at index 8:
+E0-BN keeps the configured and optimizer batch size at 8, but doubles only the Source training DataLoader fetch to a physical batch of 16. After normal YOLO preprocessing and augmentation, the trainer splits the batch at index 8:
 
 - img[:8] becomes the supervised Source batch.
 - img[8:16] becomes the BN-only companion batch through target_img.
@@ -32,7 +32,8 @@ Add experiment: e0bn and dann.supervised_batch: 8. The E0-BN run keeps the exist
 
 - epochs: 10
 - imgsz: 640
-- physical train batch: 16
+- configured/optimizer batch: 8
+- physical train-loader batch: 16
 - supervised batch: 8
 - device: 0
 - workers: 4
@@ -53,6 +54,7 @@ After the cleaned Target labels are synchronized, revalidate E0, E0-BN, and E0.5
 - Each E0-BN training step forwards 16 Source images once.
 - Only annotations for images 0 through 7 reach detection loss.
 - Images 8 through 15 influence shared BatchNorm statistics but receive no detection supervision.
+- The E0-BN training loader drops the final incomplete physical batch so every step remains exactly 8+8.
 - Domain classifier parameters receive no gradient.
 - Domain loss, domain accuracy, and GRL lambda log as zero.
 - Existing E0, E0.5, E1, inference, and export behavior remain unchanged.

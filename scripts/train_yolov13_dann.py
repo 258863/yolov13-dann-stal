@@ -24,9 +24,9 @@ def _required_string(config, key):
 def select_trainer(experiment):
     if experiment == 'e0':
         return DetectionTrainer
-    if experiment in {'e05', 'e1'}:
+    if experiment in {'e0bn', 'e05', 'e1'}:
         return DANNDetectionTrainer
-    raise ValueError('experiment must be one of e0, e05, or e1')
+    raise ValueError('experiment must be one of e0, e0bn, e05, or e1')
 
 
 def load_experiment_config(path):
@@ -68,7 +68,7 @@ def build_trainer(config_path):
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser(description='Train YOLOv13 with the P5 DANN experiment controls.')
-    parser.add_argument('--config', type=Path, required=True, help='Path to an E0, E0.5, or E1 experiment YAML.')
+    parser.add_argument('--config', type=Path, required=True, help='Path to an E0, E0-BN, E0.5, or E1 YAML.')
     return parser.parse_args(args)
 
 

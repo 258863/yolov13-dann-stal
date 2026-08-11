@@ -239,6 +239,17 @@ def test_validate_dann_config_applies_defaults() -> None:
     assert config['gamma'] == pytest.approx(10.0)
 
 
+def test_validate_e0bn_config_requires_supervised_batch_without_target_data() -> None:
+    config = validate_dann_config({'experiment': 'e0bn', 'supervised_batch': 8})
+
+    assert config['target_data'] is None
+    assert config['supervised_batch'] == 8
+    with pytest.raises(ValueError, match='supervised_batch'):
+        validate_dann_config({'experiment': 'e0bn'})
+    with pytest.raises(ValueError, match='supervised_batch'):
+        validate_dann_config({'experiment': 'e0bn', 'supervised_batch': 0})
+
+
 @pytest.mark.parametrize(
     'updates',
     [
@@ -295,6 +306,67 @@ def test_e05_trainer_disables_domain_objective_but_keeps_target_images() -> None
     assert batch['dann_enabled'] is False
 
 
+def test_e0bn_trainer_splits_source_batch_and_filters_detection_targets() -> None:
+    trainer = object.__new__(DANNDetectionTrainer)
+    trainer.device = torch.device('cpu')
+    trainer.args = SimpleNamespace(multi_scale=False, imgsz=64)
+    trainer.dann_config = validate_dann_config({'experiment': 'e0bn', 'supervised_batch': 8})
+    trainer._e0bn_supervised_batch = 8
+    batch = {
+        'img': torch.arange(16 * 3 * 8 * 8, dtype=torch.uint8).reshape(16, 3, 8, 8),
+        'batch_idx': torch.arange(16),
+        'cls': torch.ones(16, 1),
+        'bboxes': torch.full((16, 4), 0.5),
+    }
+
+    result = trainer.preprocess_batch(batch)
+
+    assert result['img'].shape == (8, 3, 8, 8)
+    assert result['target_img'].shape == (8, 3, 8, 8)
+    assert torch.equal(result['batch_idx'], torch.arange(8))
+    assert result['cls'].shape == (8, 1)
+    assert result['bboxes'].shape == (8, 4)
+    assert result['dann_enabled'] is False
+    assert result['dann_lambda'] == pytest.approx(0.0)
+
+
+def test_e0bn_doubles_only_the_training_loader_batch(monkeypatch) -> None:
+    from ultralytics.models.yolo.detect.train import DetectionTrainer
+
+    class Loader:
+        def __init__(self) -> None:
+            self.batch_sampler = SimpleNamespace(sampler=SimpleNamespace(drop_last=False))
+            self.reset_calls = 0
+
+        def reset(self) -> None:
+            self.reset_calls += 1
+
+    observed = []
+    loaders = []
+
+    def make_loader(self, dataset_path, batch_size=16, rank=0, mode='train'):
+        observed.append((batch_size, mode))
+        loader = Loader()
+        loaders.append(loader)
+        return loader
+
+    monkeypatch.setattr(
+        DetectionTrainer,
+        'get_dataloader',
+        make_loader,
+    )
+    trainer = object.__new__(DANNDetectionTrainer)
+    trainer.dann_config = validate_dann_config({'experiment': 'e0bn', 'supervised_batch': 8})
+
+    train_loader = trainer.get_dataloader('source', batch_size=8, mode='train')
+    val_loader = trainer.get_dataloader('source', batch_size=16, mode='val')
+    assert observed == [(16, 'train'), (16, 'val')]
+    assert train_loader.batch_sampler.sampler.drop_last is True
+    assert train_loader.reset_calls == 1
+    assert val_loader.batch_sampler.sampler.drop_last is False
+    assert val_loader.reset_calls == 0
+
+
 def test_target_loader_uses_target_dataset_metadata_and_restores_source() -> None:
     trainer = object.__new__(DANNDetectionTrainer)
     source_data = {'nc': 2, 'names': {0: 'source'}}
@@ -345,6 +417,7 @@ def test_select_trainer_keeps_e0_on_original_trainer() -> None:
     from ultralytics.models.yolo.detect.train import DetectionTrainer
 
     assert select_trainer('e0') is DetectionTrainer
+    assert select_trainer('e0bn') is DANNDetectionTrainer
     assert select_trainer('e05') is DANNDetectionTrainer
     assert select_trainer('e1') is DANNDetectionTrainer
 
