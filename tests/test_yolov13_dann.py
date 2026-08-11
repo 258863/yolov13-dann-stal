@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import math
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,6 +34,9 @@ def make_detection_model(**kwargs) -> DANNDetectionModel:
 
 
 def assert_nested_close(left, right) -> None:
+    if left is None:
+        assert right is None
+        return
     if isinstance(left, torch.Tensor):
         torch.testing.assert_close(left, right, rtol=1e-5, atol=1e-6)
         return
@@ -290,15 +295,50 @@ def test_e05_trainer_disables_domain_objective_but_keeps_target_images() -> None
     assert batch['dann_enabled'] is False
 
 
-@pytest.mark.parametrize(('experiment', 'requires_grad'), [('e05', False), ('e1', True)])
-def test_trainer_disables_unused_domain_parameters_for_e05_ddp(experiment, requires_grad) -> None:
+def test_target_loader_uses_target_dataset_metadata_and_restores_source() -> None:
     trainer = object.__new__(DANNDetectionTrainer)
-    trainer.data = {'nc': 2}
-    trainer.dann_config = validate_dann_config({'target_data': 'target.yaml', 'experiment': experiment})
+    source_data = {'nc': 2, 'names': {0: 'source'}}
+    target_data = {'nc': 1, 'names': {0: 'target'}, 'train': 'target/images'}
+    trainer.data = source_data
+    observed = []
+    trainer.get_dataloader = lambda *args, **kwargs: observed.append(trainer.data) or 'target-loader'
 
-    model = trainer.get_model('cfg/models/v13/yolov13.yaml', verbose=False)
+    loader = trainer._build_target_loader(target_data, target_batch=2)
 
-    assert all(parameter.requires_grad is requires_grad for parameter in model.domain_classifier.parameters())
+    assert loader == 'target-loader'
+    assert observed == [target_data]
+    assert trainer.data is source_data
+
+
+def test_target_batch_requires_exact_ddp_division() -> None:
+    assert DANNDetectionTrainer._target_batch_per_rank(8, world_size=2) == 4
+    with pytest.raises(ValueError, match='divisible'):
+        DANNDetectionTrainer._target_batch_per_rank(7, world_size=2)
+    with pytest.raises(ValueError, match='at least'):
+        DANNDetectionTrainer._target_batch_per_rank(2, world_size=4)
+
+
+def test_target_iterator_resets_infinite_loader_at_epoch_boundary() -> None:
+    class ResettableLoader:
+        sampler = None
+
+        def __init__(self) -> None:
+            self.reset_calls = 0
+
+        def reset(self) -> None:
+            self.reset_calls += 1
+
+        def __iter__(self):
+            return iter([{'img': torch.zeros(1, 3, 8, 8)}])
+
+    trainer = object.__new__(DANNDetectionTrainer)
+    trainer.target_loader = ResettableLoader()
+    trainer.epoch = 3
+
+    trainer._reset_target_iterator()
+
+    assert trainer.target_loader.reset_calls == 1
+    assert trainer._target_epoch == 3
 
 
 def test_select_trainer_keeps_e0_on_original_trainer() -> None:
@@ -359,6 +399,35 @@ def test_build_trainer_routes_e0_without_dann_arguments(tmp_path: Path, monkeypa
     assert set(calls[0]) == {'overrides'}
 
 
+def test_trainer_recovers_dann_config_in_generated_ddp_child(monkeypatch) -> None:
+    payload = {'target_data': 'target.yaml', 'experiment': 'e1', 'domain_hidden': 32}
+    monkeypatch.setenv('ULTRALYTICS_DANN_CONFIG', json.dumps(payload))
+    monkeypatch.setattr(
+        'ultralytics.models.yolo.detect.train.DetectionTrainer.__init__', lambda self, *args, **kwargs: None
+    )
+
+    trainer = DANNDetectionTrainer(dann_config=None)
+
+    assert trainer.dann_config['target_data'] == 'target.yaml'
+    assert trainer.dann_config['domain_hidden'] == 32
+
+
+def test_trainer_exposes_dann_config_only_while_parent_train_runs(monkeypatch) -> None:
+    trainer = object.__new__(DANNDetectionTrainer)
+    trainer.dann_config = validate_dann_config({'target_data': 'target.yaml', 'experiment': 'e1'})
+    monkeypatch.delenv('ULTRALYTICS_DANN_CONFIG', raising=False)
+    observed = []
+    monkeypatch.setattr(
+        'ultralytics.models.yolo.detect.train.DetectionTrainer.train',
+        lambda self: observed.append(json.loads(os.environ['ULTRALYTICS_DANN_CONFIG'])),
+    )
+
+    trainer.train()
+
+    assert observed[0]['target_data'] == 'target.yaml'
+    assert 'ULTRALYTICS_DANN_CONFIG' not in os.environ
+
+
 @pytest.mark.parametrize(('enabled', 'expect_domain_gradient'), [(False, False), (True, True)])
 def test_real_detection_loss_backward_smoke(enabled, expect_domain_gradient) -> None:
     torch.manual_seed(4)
@@ -410,6 +479,20 @@ def test_dann_training_path_does_not_change_inference_contract() -> None:
         after = model(image)
 
     assert_nested_close(after, before)
+
+
+def test_dann_model_preserves_augmented_inference() -> None:
+    torch.manual_seed(6)
+    baseline = DetectionModel('cfg/models/v13/yolov13.yaml', nc=2, verbose=False).eval()
+    dann = make_detection_model(domain_dropout=0.0).eval()
+    dann.model.load_state_dict(baseline.model.state_dict())
+    image = torch.randn(1, 3, 64, 64)
+
+    with torch.no_grad():
+        expected = baseline(image, augment=True)
+        actual = dann(image, augment=True)
+
+    assert_nested_close(actual, expected)
 
 
 def test_onnx_export_excludes_training_only_domain_branch(tmp_path: Path) -> None:

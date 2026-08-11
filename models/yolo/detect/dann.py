@@ -9,6 +9,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from ultralytics.nn.tasks import DetectionModel
+from ultralytics.utils.torch_utils import scale_img
 
 
 def _finite_real(name: str, value: Real) -> float:
@@ -110,6 +111,17 @@ class DANNDetectionModel(DetectionModel):
         p5_channels = self.model[-1].cv2[-1][0].conv.in_channels
         self.grl = GradientReversalLayer()
         self.domain_classifier = DomainClassifier(p5_channels, domain_hidden, domain_dropout)
+
+    def _predict_augment(self, images: torch.Tensor):
+        if getattr(self, 'end2end', False):
+            return super()._predict_augment(images)
+        image_size = images.shape[-2:]
+        outputs = []
+        for scale, flip in zip((1, 0.83, 0.67), (None, 3, None)):
+            augmented = scale_img(images.flip(flip) if flip else images, scale, gs=int(self.stride.max()))
+            prediction = super().predict(augmented)[0]
+            outputs.append(self._descale_pred(prediction, flip, scale, image_size))
+        return torch.cat(self._clip_augmented(outputs), -1), None
 
     def forward_with_p5(self, images: torch.Tensor):
         y = []

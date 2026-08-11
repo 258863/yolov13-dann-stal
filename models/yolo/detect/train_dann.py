@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import math
+import os
 from numbers import Real
 
 import torch
@@ -21,6 +23,7 @@ DEFAULT_DANN_CONFIG = {
     'lambda_max': 1.0,
     'gamma': 10.0,
 }
+DANN_CONFIG_ENV = 'ULTRALYTICS_DANN_CONFIG'
 
 
 def _finite_number(name, value):
@@ -72,13 +75,29 @@ def validate_dann_config(config):
 
 
 class DANNDetectionTrainer(DetectionTrainer):
-    def __init__(self, dann_config, *args, **kwargs) -> None:
+    def __init__(self, dann_config=None, *args, **kwargs) -> None:
+        if dann_config is None:
+            serialized = os.environ.get(DANN_CONFIG_ENV)
+            if serialized is None:
+                raise ValueError('dann_config is required')
+            dann_config = json.loads(serialized)
         self.dann_config = validate_dann_config(dann_config)
         self.target_loader = None
         self._target_iterator = None
         self._target_epoch = None
         self._dann_step = 0
         super().__init__(*args, **kwargs)
+
+    def train(self):
+        previous = os.environ.get(DANN_CONFIG_ENV)
+        os.environ[DANN_CONFIG_ENV] = json.dumps(self.dann_config)
+        try:
+            return super().train()
+        finally:
+            if previous is None:
+                os.environ.pop(DANN_CONFIG_ENV, None)
+            else:
+                os.environ[DANN_CONFIG_ENV] = previous
 
     def get_model(self, cfg=None, weights=None, verbose=True):
         model = DANNDetectionModel(
@@ -90,20 +109,34 @@ class DANNDetectionTrainer(DetectionTrainer):
             domain_dropout=self.dann_config['domain_dropout'],
             domain_loss_gain=self.dann_config['domain_loss_gain'],
         )
-        if self.dann_config['experiment'] == 'e05':
-            model.domain_classifier.requires_grad_(False)
         if weights:
             model.load(weights)
         return model
+
+    def _build_target_loader(self, target_data, target_batch):
+        source_data = self.data
+        try:
+            self.data = target_data
+            return self.get_dataloader(target_data['train'], batch_size=target_batch, rank=LOCAL_RANK, mode='train')
+        finally:
+            self.data = source_data
+
+    @staticmethod
+    def _target_batch_per_rank(target_batch, world_size):
+        if world_size <= 1:
+            return target_batch
+        if target_batch < world_size:
+            raise ValueError('target_batch must be at least the DDP world size')
+        if target_batch % world_size:
+            raise ValueError('target_batch must be divisible by the DDP world size')
+        return target_batch // world_size
 
     def _setup_train(self, world_size):
         super()._setup_train(world_size)
         target_data = check_det_dataset(self.dann_config['target_data'])
         target_batch = self.dann_config['target_batch'] or self.batch_size
-        target_batch = max(target_batch // max(world_size, 1), 1)
-        self.target_loader = self.get_dataloader(
-            target_data['train'], batch_size=target_batch, rank=LOCAL_RANK, mode='train'
-        )
+        target_batch = self._target_batch_per_rank(target_batch, world_size)
+        self.target_loader = self._build_target_loader(target_data, target_batch)
         self._target_iterator = iter(self.target_loader)
         self._target_epoch = None
         self._dann_step = self.start_epoch * len(self.train_loader)
@@ -112,6 +145,8 @@ class DANNDetectionTrainer(DetectionTrainer):
         sampler = getattr(self.target_loader, 'sampler', None)
         if sampler is not None and hasattr(sampler, 'set_epoch'):
             sampler.set_epoch(self.epoch)
+        if hasattr(self.target_loader, 'reset'):
+            self.target_loader.reset()
         self._target_iterator = iter(self.target_loader)
         self._target_epoch = self.epoch
 
