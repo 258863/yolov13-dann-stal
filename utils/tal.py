@@ -6,7 +6,7 @@ import torch.nn as nn
 from . import LOGGER
 from .checks import check_version
 from .metrics import bbox_iou, probiou
-from .ops import xywhr2xyxyxyxy
+from .ops import xywh2xyxy, xywhr2xyxyxyxy, xyxy2xywh
 
 TORCH_1_10 = check_version(torch.__version__, "1.10.0")
 
@@ -26,7 +26,7 @@ class TaskAlignedAssigner(nn.Module):
         eps (float): A small value to prevent division by zero.
     """
 
-    def __init__(self, topk=13, num_classes=80, alpha=1.0, beta=6.0, eps=1e-9):
+    def __init__(self, topk=13, num_classes=80, alpha=1.0, beta=6.0, eps=1e-9, stride=None, stal=False):
         """Initialize a TaskAlignedAssigner object with customizable hyperparameters."""
         super().__init__()
         self.topk = topk
@@ -35,6 +35,9 @@ class TaskAlignedAssigner(nn.Module):
         self.alpha = alpha
         self.beta = beta
         self.eps = eps
+        self.stride = stride if stride is not None else [8, 16, 32]
+        self.stride_val = self.stride[1] if len(self.stride) > 1 else self.stride[0]
+        self.stal = stal
 
     @torch.no_grad()
     def forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
@@ -119,7 +122,11 @@ class TaskAlignedAssigner(nn.Module):
 
     def get_pos_mask(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt):
         """Get in_gts mask, (b, max_num_obj, h*w)."""
-        mask_in_gts = self.select_candidates_in_gts(anc_points, gt_bboxes)
+        mask_in_gts = (
+            self.select_candidates_in_gts(anc_points, gt_bboxes, mask_gt)
+            if self.stal
+            else self.select_candidates_in_gts(anc_points, gt_bboxes)
+        )
         # Get anchor_align metric, (b, max_num_obj, h*w)
         align_metric, overlaps = self.get_box_metrics(pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_in_gts * mask_gt)
         # Get topk_metric mask, (b, max_num_obj, h*w)
@@ -237,14 +244,14 @@ class TaskAlignedAssigner(nn.Module):
 
         return target_labels, target_bboxes, target_scores
 
-    @staticmethod
-    def select_candidates_in_gts(xy_centers, gt_bboxes, eps=1e-9):
+    def select_candidates_in_gts(self, xy_centers, gt_bboxes, mask_gt=None, eps=1e-9):
         """
         Select positive anchor centers within ground truth bounding boxes.
 
         Args:
             xy_centers (torch.Tensor): Anchor center coordinates, shape (h*w, 2).
             gt_bboxes (torch.Tensor): Ground truth bounding boxes, shape (b, n_boxes, 4).
+            mask_gt (torch.Tensor, optional): Valid ground-truth mask, shape (b, n_boxes, 1).
             eps (float, optional): Small value for numerical stability. Defaults to 1e-9.
 
         Returns:
@@ -254,6 +261,18 @@ class TaskAlignedAssigner(nn.Module):
             b: batch size, n_boxes: number of ground truth boxes, h: height, w: width.
             Bounding box format: [x_min, y_min, x_max, y_max].
         """
+        if self.stal:
+            gt_bboxes_xywh = xyxy2xywh(gt_bboxes)
+            wh_mask = gt_bboxes_xywh[..., 2:] < self.stride[0]
+            if mask_gt is not None:
+                wh_mask &= mask_gt.bool()
+            gt_bboxes_xywh[..., 2:] = torch.where(
+                wh_mask,
+                torch.as_tensor(self.stride_val, dtype=gt_bboxes.dtype, device=gt_bboxes.device),
+                gt_bboxes_xywh[..., 2:],
+            )
+            gt_bboxes = xywh2xyxy(gt_bboxes_xywh)
+
         n_anchors = xy_centers.shape[0]
         bs, n_boxes, _ = gt_bboxes.shape
         lt, rb = gt_bboxes.view(-1, 1, 4).chunk(2, 2)  # left-top, right-bottom
