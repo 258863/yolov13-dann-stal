@@ -88,6 +88,10 @@ class DomainClassifier(nn.Module):
 
 
 class DANNDetectionModel(DetectionModel):
+    DOMAIN_FEATURE_BRANCHES = {23: 0, 27: 1, 31: 2}
+    BACKBONE_DOMAIN_FEATURE_LAYERS = {1}
+    VERIFIED_DOMAIN_FEATURE_LAYERS = (1, 23, 27, 31)
+
     def __init__(
         self,
         cfg='yolov8n.yaml',
@@ -96,21 +100,57 @@ class DANNDetectionModel(DetectionModel):
         verbose=True,
         *,
         p5_layer=31,
+        domain_feature_layers=None,
         domain_hidden=256,
         domain_dropout=0.1,
         domain_loss_gain=1.0,
     ) -> None:
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
-        if p5_layer != 31:
-            raise ValueError('the first DANN version requires p5_layer=31')
+        if domain_feature_layers is None:
+            domain_feature_layers = (p5_layer,)
+        elif not isinstance(domain_feature_layers, (list, tuple)):
+            raise TypeError('domain_feature_layers must be a list or tuple')
+        else:
+            domain_feature_layers = tuple(domain_feature_layers)
+            if p5_layer != 31 and p5_layer != domain_feature_layers[0]:
+                raise ValueError('p5_layer and domain_feature_layers conflict')
+        if not domain_feature_layers:
+            raise ValueError('domain_feature_layers must not be empty')
+        if any(not isinstance(layer, int) or isinstance(layer, bool) for layer in domain_feature_layers):
+            raise TypeError('domain_feature_layers must contain integers')
+        if len(set(domain_feature_layers)) != len(domain_feature_layers):
+            raise ValueError('domain_feature_layers must contain unique layers')
+        if any(layer not in self.VERIFIED_DOMAIN_FEATURE_LAYERS for layer in domain_feature_layers):
+            raise ValueError('domain_feature_layers contains an unverified YOLOv13 feature layer')
         domain_loss_gain = _finite_real('domain_loss_gain', domain_loss_gain)
         if domain_loss_gain < 0.0:
             raise ValueError('domain_loss_gain must be non-negative')
-        self.p5_layer = p5_layer
+        self.domain_feature_layers = domain_feature_layers
+        self.p5_layer = domain_feature_layers[0]
         self.domain_loss_gain = domain_loss_gain
-        p5_channels = self.model[-1].cv2[-1][0].conv.in_channels
         self.grl = GradientReversalLayer()
-        self.domain_classifier = DomainClassifier(p5_channels, domain_hidden, domain_dropout)
+        self.extra_grls = nn.ModuleList(GradientReversalLayer() for _ in domain_feature_layers[1:])
+        channels = [self._domain_feature_channels(layer) for layer in domain_feature_layers]
+        self.domain_classifier = DomainClassifier(channels[0], domain_hidden, domain_dropout)
+        self.extra_domain_classifiers = nn.ModuleList(
+            DomainClassifier(channel, domain_hidden, domain_dropout) for channel in channels[1:]
+        )
+
+    @property
+    def grls(self):
+        return (self.grl, *self.extra_grls)
+
+    @property
+    def domain_classifiers(self):
+        return (self.domain_classifier, *self.extra_domain_classifiers)
+
+    def _domain_feature_channels(self, layer: int) -> int:
+        if layer in self.BACKBONE_DOMAIN_FEATURE_LAYERS:
+            return self.model[layer].conv.out_channels
+        detect = self.model[-1]
+        if detect.f != list(self.DOMAIN_FEATURE_BRANCHES):
+            raise RuntimeError(f'expected YOLOv13 Detect inputs {list(self.DOMAIN_FEATURE_BRANCHES)}, received {detect.f}')
+        return detect.cv2[self.DOMAIN_FEATURE_BRANCHES[layer]][0].conv.in_channels
 
     def _predict_augment(self, images: torch.Tensor):
         if getattr(self, 'end2end', False):
@@ -123,20 +163,28 @@ class DANNDetectionModel(DetectionModel):
             outputs.append(self._descale_pred(prediction, flip, scale, image_size))
         return torch.cat(self._clip_augmented(outputs), -1), None
 
-    def forward_with_p5(self, images: torch.Tensor):
+    def forward_with_domain_features(self, images: torch.Tensor):
         y = []
-        p5 = None
+        selected_layers = set(self.domain_feature_layers)
+        domain_features = {}
         output = images
         for module in self.model:
             if module.f != -1:
                 output = y[module.f] if isinstance(module.f, int) else [output if j == -1 else y[j] for j in module.f]
             output = module(output)
-            if module.i == self.p5_layer:
-                p5 = output
+            if module.i in selected_layers:
+                domain_features[module.i] = output
             y.append(output if module.i in self.save else None)
-        if p5 is None:
-            raise RuntimeError(f'P5 layer {self.p5_layer} was not executed')
-        return output, p5
+        missing = selected_layers.difference(domain_features)
+        if missing:
+            raise RuntimeError(f'domain feature layers were not executed: {sorted(missing)}')
+        return output, tuple(domain_features[layer] for layer in self.domain_feature_layers)
+
+    def forward_with_p5(self, images: torch.Tensor):
+        if len(self.domain_feature_layers) != 1:
+            raise RuntimeError('forward_with_p5 requires exactly one configured domain feature layer')
+        output, domain_features = self.forward_with_domain_features(images)
+        return output, domain_features[0]
 
     @staticmethod
     def _validate_domain_images(source: torch.Tensor, target: torch.Tensor) -> None:
@@ -178,9 +226,12 @@ class DANNDetectionModel(DetectionModel):
         target_images = batch['target_img']
         self._validate_domain_images(source_images, target_images)
         source_batch_size = source_images.shape[0]
-        predictions, p5 = self.forward_with_p5(torch.cat((source_images, target_images), dim=0))
-        source_predictions = self._source_predictions(predictions, source_batch_size)
-        detection_loss, detection_items = self.criterion(source_predictions, self._source_batch(batch))
+        predictions, domain_features = self.forward_with_domain_features(torch.cat((source_images, target_images), dim=0))
+        target_supervised = batch.get('target_supervised', False)
+        if not isinstance(target_supervised, bool):
+            raise TypeError('target_supervised must be a bool')
+        detection_predictions = predictions if target_supervised else self._source_predictions(predictions, source_batch_size)
+        detection_loss, detection_items = self.criterion(detection_predictions, self._source_batch(batch))
 
         enabled = batch.get('dann_enabled', True)
         coefficient = _finite_real('dann_lambda', batch.get('dann_lambda', 1.0))
@@ -194,13 +245,18 @@ class DANNDetectionModel(DetectionModel):
         target_batch_size = target_images.shape[0]
         domain_labels = torch.cat(
             (
-                torch.zeros(source_batch_size, dtype=torch.long, device=p5.device),
-                torch.ones(target_batch_size, dtype=torch.long, device=p5.device),
+                torch.zeros(source_batch_size, dtype=torch.long, device=domain_features[0].device),
+                torch.ones(target_batch_size, dtype=torch.long, device=domain_features[0].device),
             )
         )
-        domain_logits = self.domain_classifier(self.grl(p5, coefficient))
-        domain_loss = F.cross_entropy(domain_logits, domain_labels)
-        domain_accuracy = (domain_logits.argmax(dim=1) == domain_labels).float().mean()
+        domain_losses = []
+        domain_accuracies = []
+        for features, grl, classifier in zip(domain_features, self.grls, self.domain_classifiers):
+            domain_logits = classifier(grl(features, coefficient))
+            domain_losses.append(F.cross_entropy(domain_logits, domain_labels))
+            domain_accuracies.append((domain_logits.argmax(dim=1) == domain_labels).float().mean())
+        domain_loss = torch.stack(domain_losses).mean()
+        domain_accuracy = torch.stack(domain_accuracies).mean()
         total_loss = detection_loss + self.domain_loss_gain * domain_loss * source_batch_size
         metrics = detection_items.new_tensor((domain_loss.detach(), domain_accuracy.detach(), coefficient))
         return total_loss, torch.cat((detection_items, metrics))

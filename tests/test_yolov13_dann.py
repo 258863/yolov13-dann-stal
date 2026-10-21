@@ -21,12 +21,23 @@ class RecordingCriterion:
     def __init__(self) -> None:
         self.batch_sizes = None
         self.batch_keys = None
+        self.batch_idx = None
 
     def __call__(self, predictions, batch):
         self.batch_sizes = [prediction.shape[0] for prediction in predictions]
         self.batch_keys = set(batch)
+        self.batch_idx = batch.get('batch_idx')
         zero = sum((prediction.sum() * 0.0 for prediction in predictions), torch.zeros((), device=predictions[0].device))
         return zero, torch.zeros(3, device=predictions[0].device)
+
+
+class ConstantDomainClassifier(nn.Module):
+    def __init__(self, logits) -> None:
+        super().__init__()
+        self.register_buffer('logits', torch.tensor(logits, dtype=torch.float32))
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.logits.to(features).expand(features.shape[0], -1)
 
 
 def make_detection_model(**kwargs) -> DANNDetectionModel:
@@ -132,6 +143,42 @@ def test_dann_model_uses_verified_yolov13_layers() -> None:
     assert model.domain_classifier.in_channels == model.model[32].cv2[-1][0].conv.in_channels
 
 
+@pytest.mark.parametrize(('feature_layer', 'detect_branch'), [(23, 0), (27, 1), (31, 2)])
+def test_dann_model_supports_verified_pyramid_layers(feature_layer, detect_branch) -> None:
+    model = make_detection_model(p5_layer=feature_layer)
+
+    assert model.p5_layer == feature_layer
+    assert model.domain_classifier.in_channels == model.model[32].cv2[detect_branch][0].conv.in_channels
+
+
+def test_dann_model_supports_p2_downsampling_output() -> None:
+    model = make_detection_model(p5_layer=1)
+
+    assert model.p5_layer == 1
+    assert model.model[1].i == 1
+    assert model.domain_classifier.in_channels == model.model[1].conv.out_channels == 32
+
+
+def test_dann_model_supports_p2_p3_multilayer_features() -> None:
+    model = make_detection_model(domain_feature_layers=(1, 23))
+
+    assert model.domain_feature_layers == (1, 23)
+    assert [classifier.in_channels for classifier in model.domain_classifiers] == [32, 64]
+
+
+def test_forward_with_domain_features_preserves_prediction_contract() -> None:
+    torch.manual_seed(2)
+    model = make_detection_model(domain_feature_layers=(1, 23)).eval()
+    images = torch.randn(2, 3, 64, 64)
+
+    with torch.no_grad():
+        expected = model(images)
+        actual, features = model.forward_with_domain_features(images)
+
+    assert [feature.shape[:2] for feature in features] == [(2, 32), (2, 64)]
+    assert_nested_close(actual, expected)
+
+
 def test_forward_with_p5_preserves_prediction_contract() -> None:
     torch.manual_seed(2)
     model = make_detection_model().eval()
@@ -144,6 +191,93 @@ def test_forward_with_p5_preserves_prediction_contract() -> None:
     assert p5.shape[0] == 2
     assert p5.shape[1] == model.domain_classifier.in_channels
     assert_nested_close(actual, expected)
+
+
+def test_p3_dann_loss_backward_smoke() -> None:
+    model = make_detection_model(p5_layer=23, domain_dropout=0.0).train()
+    model.criterion = RecordingCriterion()
+
+    loss, items = model.loss(
+        {
+            'img': torch.randn(1, 3, 64, 64),
+            'target_img': torch.randn(1, 3, 64, 64) + 1.0,
+            'dann_enabled': True,
+            'dann_lambda': 0.02,
+        }
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(items).all()
+    assert model.domain_classifier.classifier[-1].weight.grad is not None
+    assert model.model[0].conv.weight.grad is not None
+
+
+def test_p2_dann_loss_backward_smoke() -> None:
+    model = make_detection_model(p5_layer=1, domain_dropout=0.0).train()
+    model.criterion = RecordingCriterion()
+
+    loss, items = model.loss(
+        {
+            'img': torch.randn(1, 3, 64, 64),
+            'target_img': torch.randn(1, 3, 64, 64) + 1.0,
+            'dann_enabled': True,
+            'dann_lambda': 0.02,
+        }
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(items).all()
+    assert model.domain_classifier.classifier[-1].weight.grad is not None
+    assert model.model[0].conv.weight.grad is not None
+
+
+def test_p2_p3_multilayer_dann_loss_backward_reaches_both_classifiers() -> None:
+    model = make_detection_model(
+        domain_feature_layers=(1, 23), domain_dropout=0.0
+    ).train()
+    model.criterion = RecordingCriterion()
+
+    loss, items = model.loss(
+        {
+            'img': torch.randn(1, 3, 64, 64),
+            'target_img': torch.randn(1, 3, 64, 64) + 1.0,
+            'dann_enabled': True,
+            'dann_lambda': 0.02,
+        }
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(items).all()
+    assert all(classifier.classifier[-1].weight.grad is not None for classifier in model.domain_classifiers)
+    assert model.model[0].conv.weight.grad is not None
+
+
+def test_p2_p3_multilayer_domain_loss_is_branch_mean() -> None:
+    model = make_detection_model(domain_feature_layers=(1, 23), domain_dropout=0.0).train()
+    model.criterion = RecordingCriterion()
+    model.domain_classifier = ConstantDomainClassifier((2.0, 0.0))
+    model.extra_domain_classifiers = nn.ModuleList([ConstantDomainClassifier((0.0, 0.0))])
+
+    _, items = model.loss(
+        {
+            'img': torch.randn(1, 3, 64, 64),
+            'target_img': torch.randn(1, 3, 64, 64),
+            'dann_enabled': True,
+            'dann_lambda': 0.02,
+        }
+    )
+
+    labels = torch.tensor([0, 1])
+    expected = torch.stack(
+        (
+            torch.nn.functional.cross_entropy(torch.tensor([[2.0, 0.0], [2.0, 0.0]]), labels),
+            torch.nn.functional.cross_entropy(torch.zeros(2, 2), labels),
+        )
+    ).mean()
+    assert items[3] == pytest.approx(expected.item())
 
 
 def test_dann_loss_sends_only_source_predictions_to_detection_criterion() -> None:
@@ -232,11 +366,60 @@ def test_validate_dann_config_applies_defaults() -> None:
     config = validate_dann_config({'target_data': 'target.yaml', 'experiment': 'e1'})
 
     assert config['target_batch'] is None
+    assert config['target_supervised'] is False
+    assert config['source_style_aug'] is False
+    assert config['source_style_prob'] == pytest.approx(0.50)
+    assert config['source_style_alpha'] == pytest.approx(0.30)
     assert config['p5_layer'] == 31
+    assert config['domain_feature_layers'] == (31,)
     assert config['domain_hidden'] == 256
     assert config['domain_loss_gain'] == pytest.approx(1.0)
     assert config['lambda_max'] == pytest.approx(1.0)
     assert config['gamma'] == pytest.approx(10.0)
+    assert config['warmup_fraction'] == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize('feature_layer', [1, 23, 27, 31])
+def test_validate_dann_config_accepts_verified_pyramid_layers(feature_layer) -> None:
+    config = validate_dann_config({'target_data': 'target.yaml', 'experiment': 'e1', 'p5_layer': feature_layer})
+
+    assert config['p5_layer'] == feature_layer
+    assert config['domain_feature_layers'] == (feature_layer,)
+
+
+def test_validate_dann_config_accepts_p2_p3_multilayer_features() -> None:
+    config = validate_dann_config(
+        {'target_data': 'target.yaml', 'experiment': 'e1', 'domain_feature_layers': [1, 23]}
+    )
+
+    assert config['domain_feature_layers'] == (1, 23)
+
+
+@pytest.mark.parametrize(
+    'domain_feature_layers',
+    [[], [1, 1], [1, 30], [True, 23], '1,23'],
+)
+def test_validate_dann_config_rejects_invalid_multilayer_features(domain_feature_layers) -> None:
+    with pytest.raises((TypeError, ValueError), match='domain_feature_layers'):
+        validate_dann_config(
+            {
+                'target_data': 'target.yaml',
+                'experiment': 'e1',
+                'domain_feature_layers': domain_feature_layers,
+            }
+        )
+
+
+def test_validate_dann_config_rejects_conflicting_single_and_multilayer_features() -> None:
+    with pytest.raises(ValueError, match='conflict'):
+        validate_dann_config(
+            {
+                'target_data': 'target.yaml',
+                'experiment': 'e1',
+                'p5_layer': 27,
+                'domain_feature_layers': [1, 23],
+            }
+        )
 
 
 def test_validate_e0bn_config_requires_supervised_batch_without_target_data() -> None:
@@ -255,14 +438,46 @@ def test_validate_e0bn_config_requires_supervised_batch_without_target_data() ->
     [
         {},
         {'target_data': 'target.yaml', 'experiment': 'e0'},
-        {'target_data': 'target.yaml', 'experiment': 'e1', 'p5_layer': 27},
+        {'target_data': 'target.yaml', 'experiment': 'e1', 'p5_layer': 30},
         {'target_data': 'target.yaml', 'experiment': 'e1', 'target_batch': 0},
+        {'target_data': 'target.yaml', 'experiment': 'e1', 'target_supervised': 1},
         {'target_data': 'target.yaml', 'experiment': 'e1', 'lambda_max': 1.1},
+        {'target_data': 'target.yaml', 'experiment': 'e1', 'warmup_fraction': -0.1},
+        {'target_data': 'target.yaml', 'experiment': 'e1', 'warmup_fraction': 1.0},
     ],
 )
 def test_validate_dann_config_rejects_invalid_values(updates) -> None:
     with pytest.raises((TypeError, ValueError)):
         validate_dann_config(updates)
+
+
+@pytest.mark.parametrize('name', ['source_style_prob', 'source_style_alpha'])
+@pytest.mark.parametrize('value', [-0.01, 1.01, math.inf, math.nan, True, '0.5'])
+def test_validate_dann_config_rejects_invalid_source_style_values(name, value) -> None:
+    with pytest.raises((TypeError, ValueError), match=name):
+        validate_dann_config({'target_data': 'target.yaml', 'experiment': 'e1', name: value})
+
+
+@pytest.mark.parametrize('value', [0.0, 1.0])
+def test_validate_dann_config_accepts_source_style_boundaries(value) -> None:
+    config = validate_dann_config(
+        {
+            'target_data': 'target.yaml',
+            'experiment': 'e1',
+            'source_style_aug': True,
+            'source_style_prob': value,
+            'source_style_alpha': value,
+        }
+    )
+
+    assert config['source_style_aug'] is True
+    assert config['source_style_prob'] == pytest.approx(value)
+    assert config['source_style_alpha'] == pytest.approx(value)
+
+
+def test_validate_dann_config_rejects_non_boolean_source_style_switch() -> None:
+    with pytest.raises(TypeError, match='source_style_aug'):
+        validate_dann_config({'target_data': 'target.yaml', 'experiment': 'e1', 'source_style_aug': 1})
 
 
 def make_trainer_without_init(experiment='e1') -> DANNDetectionTrainer:
@@ -281,6 +496,53 @@ def make_trainer_without_init(experiment='e1') -> DANNDetectionTrainer:
     return trainer
 
 
+def test_target_style_source_transfers_moments_and_cycles_target_batch() -> None:
+    source = torch.tensor([[[[0.0, 0.2], [0.4, 0.6]]]]).repeat(2, 3, 1, 1)
+    target = torch.tensor([[[[0.2, 0.4], [0.6, 0.8]]]]).repeat(1, 3, 1, 1)
+    original_target = target.clone()
+
+    actual = DANNDetectionTrainer._target_style_source(source, target, probability=1.0, alpha=1.0)
+
+    assert actual.shape == source.shape
+    torch.testing.assert_close(actual.mean((-2, -1)), target.mean((-2, -1)).expand(2, -1))
+    torch.testing.assert_close(
+        actual.std((-2, -1), unbiased=False),
+        target.std((-2, -1), unbiased=False).expand(2, -1),
+    )
+    assert actual.min() >= 0.0
+    assert actual.max() <= 1.0
+    assert torch.equal(target, original_target)
+
+
+@pytest.mark.parametrize(('probability', 'alpha'), [(0.0, 0.30), (0.50, 0.0)])
+def test_target_style_source_is_exact_noop_when_effect_is_disabled(probability, alpha) -> None:
+    source = torch.rand(2, 3, 4, 4)
+    target = torch.rand(1, 3, 4, 4)
+
+    actual = DANNDetectionTrainer._target_style_source(source, target, probability, alpha)
+
+    assert actual is source
+
+
+def test_trainer_applies_target_style_only_to_source() -> None:
+    trainer = make_trainer_without_init()
+    trainer.dann_config = validate_dann_config(
+        {
+            'target_data': 'target.yaml',
+            'experiment': 'e1',
+            'source_style_aug': True,
+            'source_style_prob': 1.0,
+            'source_style_alpha': 0.30,
+        }
+    )
+    source = {'img': torch.zeros(1, 3, 64, 64, dtype=torch.uint8), 'cls': torch.zeros(0, 1)}
+
+    batch = trainer.preprocess_batch(source)
+
+    torch.testing.assert_close(batch['img'], torch.full_like(batch['img'], 0.30))
+    assert torch.all(batch['target_img'] == 1.0)
+
+
 def test_trainer_cycles_target_batches_and_matches_source_shape() -> None:
     trainer = make_trainer_without_init()
     source = {'img': torch.zeros(1, 3, 64, 64, dtype=torch.uint8), 'cls': torch.zeros(0, 1)}
@@ -295,6 +557,75 @@ def test_trainer_cycles_target_batches_and_matches_source_shape() -> None:
     assert first['dann_lambda'] == pytest.approx(0.0)
     assert second['dann_lambda'] > first['dann_lambda']
     assert 'target_cls' not in first
+
+
+
+def test_supervised_target_annotations_are_merged_with_batch_offset() -> None:
+    trainer = make_trainer_without_init()
+    trainer.dann_config = validate_dann_config(
+        {'target_data': 'target.yaml', 'experiment': 'e1', 'target_supervised': True}
+    )
+    trainer.target_loader = [
+        {
+            'img': torch.full((2, 3, 64, 64), 255, dtype=torch.uint8),
+            'batch_idx': torch.tensor([0, 1]),
+            'cls': torch.tensor([[0.0], [1.0]]),
+            'bboxes': torch.tensor([[0.5, 0.5, 0.2, 0.2], [0.4, 0.4, 0.1, 0.1]]),
+        }
+    ]
+    trainer._target_iterator = iter(trainer.target_loader)
+    trainer._target_epoch = None
+    source = {
+        'img': torch.zeros(2, 3, 64, 64, dtype=torch.uint8),
+        'batch_idx': torch.tensor([0]),
+        'cls': torch.tensor([[1.0]]),
+        'bboxes': torch.tensor([[0.5, 0.5, 0.3, 0.3]]),
+    }
+
+    batch = trainer.preprocess_batch(source)
+
+    assert batch['target_supervised'] is True
+    assert torch.equal(batch['batch_idx'], torch.tensor([0, 2, 3]))
+    assert batch['cls'].shape == (3, 1)
+    assert batch['bboxes'].shape == (3, 4)
+
+
+def test_supervised_target_loss_uses_predictions_from_both_domains() -> None:
+    model = make_detection_model().train()
+    model.criterion = RecordingCriterion()
+
+    model.loss(
+        {
+            'img': torch.randn(1, 3, 64, 64),
+            'target_img': torch.randn(1, 3, 64, 64),
+            'batch_idx': torch.tensor([0, 1]),
+            'cls': torch.tensor([[0.0], [1.0]]),
+            'bboxes': torch.tensor([[0.5, 0.5, 0.2, 0.2], [0.4, 0.4, 0.1, 0.1]]),
+            'target_supervised': True,
+            'dann_enabled': False,
+        }
+    )
+
+    assert model.criterion.batch_sizes == [2, 2, 2]
+    assert torch.equal(model.criterion.batch_idx, torch.tensor([0, 1]))
+
+
+def test_trainer_keeps_lambda_zero_through_warmup_boundary() -> None:
+    trainer = make_trainer_without_init()
+    trainer.dann_config = validate_dann_config(
+        {'target_data': 'target.yaml', 'experiment': 'e1', 'lambda_max': 0.1, 'warmup_fraction': 0.3}
+    )
+    trainer.train_loader = [None] * 11
+    trainer.epochs = 1
+    source = {'img': torch.zeros(1, 3, 64, 64, dtype=torch.uint8)}
+
+    trainer._dann_step = 3
+    at_boundary = trainer.preprocess_batch(source.copy())
+    trainer._dann_step = 4
+    after_boundary = trainer.preprocess_batch(source.copy())
+
+    assert at_boundary['dann_lambda'] == pytest.approx(0.0)
+    assert after_boundary['dann_lambda'] > 0.0
 
 
 def test_e05_trainer_disables_domain_objective_but_keeps_target_images() -> None:
@@ -443,6 +774,32 @@ def test_load_experiment_config_separates_upstream_and_dann_keys(tmp_path: Path)
     assert 'dann' not in overrides
     assert dann_config['target_data'] == 'target.yaml'
     assert dann_config['domain_hidden'] == 16
+
+
+def test_a1_seed42_config_preserves_p2_dann_baseline() -> None:
+    config_path = Path(__file__).parents[1] / 'configs' / 'dann' / 'ic_p2_target_style_a1_seed42.yaml'
+
+    overrides, dann_config = load_experiment_config(config_path)
+
+    assert overrides['data'] == 'F:/dann_compare_20260811/experiment/source.yaml'
+    assert overrides['pretrained'] == 'F:/dann_compare_20260811/yolov13n.pt'
+    assert overrides['epochs'] == 10
+    assert overrides['imgsz'] == 640
+    assert overrides['batch'] == 8
+    assert overrides['workers'] == 4
+    assert overrides['amp'] is False
+    assert overrides['seed'] == 42
+    assert overrides['deterministic'] is True
+    assert overrides['stal'] is False
+    assert overrides['val'] is False
+    assert dann_config['target_data'] == 'F:/dann_compare_20260811/experiment/target.yaml'
+    assert dann_config['target_batch'] == 8
+    assert dann_config['target_supervised'] is True
+    assert dann_config['domain_feature_layers'] == (1,)
+    assert dann_config['lambda_max'] == pytest.approx(0.02)
+    assert dann_config['source_style_aug'] is True
+    assert dann_config['source_style_prob'] == pytest.approx(0.50)
+    assert dann_config['source_style_alpha'] == pytest.approx(0.30)
 
 
 def test_load_experiment_config_rejects_missing_source(tmp_path: Path) -> None:

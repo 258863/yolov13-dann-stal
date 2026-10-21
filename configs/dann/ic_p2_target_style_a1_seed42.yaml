@@ -1,0 +1,37 @@
+experiment: e1
+source_data: F:/dann_compare_20260811/experiment/source.yaml
+target_data: F:/dann_compare_20260811/experiment/target.yaml
+model: F:/dann_compare_20260811/ultralytics/cfg/models/v13/yolov13.yaml
+weights: F:/dann_compare_20260811/yolov13n.pt
+
+train:
+  epochs: 10
+  imgsz: 640
+  batch: 8
+  device: 0
+  workers: 4
+  amp: false
+  seed: 42
+  deterministic: true
+  stal: false
+  project: F:/dann_compare_20260811/runs
+  exist_ok: true
+  plots: false
+  verbose: true
+  save: true
+  val: false
+  name: p2_dann_target_style_a1_seed42
+
+dann:
+  target_batch: 8
+  target_supervised: true
+  p5_layer: 1
+  domain_hidden: 256
+  domain_dropout: 0.1
+  domain_loss_gain: 1.0
+  lambda_max: 0.02
+  gamma: 10.0
+  warmup_fraction: 0.0
+  source_style_aug: true
+  source_style_prob: 0.50
+  source_style_alpha: 0.30

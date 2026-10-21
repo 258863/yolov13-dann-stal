@@ -41,3 +41,21 @@ Run seed 42 first as a screening experiment. If STAL does not increase FN and
 shows a useful improvement, run seeds 43 and 44 and report the three-seed
 mean at `conf=0.40`. Compare TP, FP, FN, miss rate, and per-image prediction
 visualizations on the same untouched validation set.
+
+## P2 + STAL Result
+
+The controlled three-seed experiment was completed on 2026-08-24. It reused
+the P2 configuration exactly and changed only `stal=True` plus output names.
+
+| Method at conf=0.40 | Mean TP | Mean FP | Mean FN | Miss rate |
+| --- | ---: | ---: | ---: | ---: |
+| P2 TAL | 58.00 | 2.00 | 1.00 | 1.69% |
+| P2 STAL | 56.00 | 2.33 | 3.00 | 5.08% |
+
+P2 STAL regressed FN in every seed: `1 -> 3` for seed 42, `0 -> 3` for
+seed 43, and `2 -> 3` for seed 44. Mean Target mAP50-95 also decreased from
+`0.54885` to `0.54219`. All 15 empty-label images remained free of overkill.
+
+Decision: keep the P2 TAL configuration and do not enable STAL for the current
+production candidate. Full artifacts are stored under
+`D:\work\dz\dann_compare_20260824\p2_dann_stal`.

@@ -17,13 +17,19 @@ from ultralytics.utils import LOCAL_RANK, RANK
 DEFAULT_DANN_CONFIG = {
     'target_data': None,
     'target_batch': None,
+    'target_supervised': False,
+    'source_style_aug': False,
+    'source_style_prob': 0.50,
+    'source_style_alpha': 0.30,
     'supervised_batch': None,
     'p5_layer': 31,
+    'domain_feature_layers': None,
     'domain_hidden': 256,
     'domain_dropout': 0.1,
     'domain_loss_gain': 1.0,
     'lambda_max': 1.0,
     'gamma': 10.0,
+    'warmup_fraction': 0.0,
 }
 DANN_CONFIG_ENV = 'ULTRALYTICS_DANN_CONFIG'
 
@@ -48,8 +54,27 @@ def validate_dann_config(config):
         not isinstance(merged['target_data'], (str, bytes)) or not merged['target_data']
     ):
         raise ValueError('target_data is required')
-    if merged['p5_layer'] != 31:
-        raise ValueError('p5_layer must be 31 in the first DANN version')
+    if merged['p5_layer'] not in DANNDetectionModel.VERIFIED_DOMAIN_FEATURE_LAYERS:
+        raise ValueError('p5_layer must be one of the verified YOLOv13 feature layers: 1, 23, 27, or 31')
+    domain_feature_layers = merged['domain_feature_layers']
+    if domain_feature_layers is None:
+        domain_feature_layers = (merged['p5_layer'],)
+    else:
+        if not isinstance(domain_feature_layers, (list, tuple)):
+            raise TypeError('domain_feature_layers must be a list or tuple')
+        domain_feature_layers = tuple(domain_feature_layers)
+        if not domain_feature_layers:
+            raise ValueError('domain_feature_layers must not be empty')
+        if any(not isinstance(layer, int) or isinstance(layer, bool) for layer in domain_feature_layers):
+            raise TypeError('domain_feature_layers must contain integers')
+        if len(set(domain_feature_layers)) != len(domain_feature_layers):
+            raise ValueError('domain_feature_layers must contain unique layers')
+        if any(layer not in DANNDetectionModel.VERIFIED_DOMAIN_FEATURE_LAYERS for layer in domain_feature_layers):
+            raise ValueError('domain_feature_layers contains an unverified YOLOv13 feature layer')
+        if 'p5_layer' in config and config['p5_layer'] != domain_feature_layers[0]:
+            raise ValueError('p5_layer and domain_feature_layers conflict')
+    merged['p5_layer'] = domain_feature_layers[0]
+    merged['domain_feature_layers'] = domain_feature_layers
     for name in ('domain_hidden',):
         if not isinstance(merged[name], int) or isinstance(merged[name], bool) or merged[name] <= 0:
             raise ValueError(f'{name} must be a positive integer')
@@ -58,6 +83,10 @@ def validate_dann_config(config):
         not isinstance(target_batch, int) or isinstance(target_batch, bool) or target_batch <= 0
     ):
         raise ValueError('target_batch must be a positive integer or null')
+    if not isinstance(merged['target_supervised'], bool):
+        raise TypeError('target_supervised must be a bool')
+    if not isinstance(merged['source_style_aug'], bool):
+        raise TypeError('source_style_aug must be a bool')
     supervised_batch = merged['supervised_batch']
     if supervised_batch is not None and (
         not isinstance(supervised_batch, int) or isinstance(supervised_batch, bool) or supervised_batch <= 0
@@ -69,6 +98,9 @@ def validate_dann_config(config):
     gain = _finite_number('domain_loss_gain', merged['domain_loss_gain'])
     lambda_max = _finite_number('lambda_max', merged['lambda_max'])
     gamma = _finite_number('gamma', merged['gamma'])
+    warmup_fraction = _finite_number('warmup_fraction', merged['warmup_fraction'])
+    source_style_prob = _finite_number('source_style_prob', merged['source_style_prob'])
+    source_style_alpha = _finite_number('source_style_alpha', merged['source_style_alpha'])
     if not 0.0 <= dropout < 1.0:
         raise ValueError('domain_dropout must be within [0, 1)')
     if gain < 0.0:
@@ -77,11 +109,20 @@ def validate_dann_config(config):
         raise ValueError('lambda_max must be within [0, 1]')
     if gamma <= 0.0:
         raise ValueError('gamma must be greater than zero')
+    if not 0.0 <= warmup_fraction < 1.0:
+        raise ValueError('warmup_fraction must be within [0, 1)')
+    if not 0.0 <= source_style_prob <= 1.0:
+        raise ValueError('source_style_prob must be within [0, 1]')
+    if not 0.0 <= source_style_alpha <= 1.0:
+        raise ValueError('source_style_alpha must be within [0, 1]')
     merged.update(
         domain_dropout=dropout,
         domain_loss_gain=gain,
         lambda_max=lambda_max,
         gamma=gamma,
+        warmup_fraction=warmup_fraction,
+        source_style_prob=source_style_prob,
+        source_style_alpha=source_style_alpha,
     )
     return merged
 
@@ -117,6 +158,7 @@ class DANNDetectionTrainer(DetectionTrainer):
             nc=self.data['nc'],
             verbose=verbose and RANK == -1,
             p5_layer=self.dann_config['p5_layer'],
+            domain_feature_layers=self.dann_config['domain_feature_layers'],
             domain_hidden=self.dann_config['domain_hidden'],
             domain_dropout=self.dann_config['domain_dropout'],
             domain_loss_gain=self.dann_config['domain_loss_gain'],
@@ -193,6 +235,23 @@ class DANNDetectionTrainer(DetectionTrainer):
             self._target_iterator = iter(self.target_loader)
             return next(self._target_iterator)
 
+    @staticmethod
+    def _target_style_source(source, target, probability, alpha):
+        if probability == 0.0 or alpha == 0.0:
+            return source
+        dims = (-2, -1)
+        source_mean = source.mean(dims, keepdim=True)
+        source_std = source.std(dims, keepdim=True, unbiased=False).clamp_min(torch.finfo(source.dtype).eps)
+        target = target.detach()
+        target_mean = target.mean(dims, keepdim=True)
+        target_std = target.std(dims, keepdim=True, unbiased=False)
+        indices = torch.arange(source.shape[0], device=source.device) % target.shape[0]
+        transferred = (source - source_mean) / source_std
+        transferred = transferred * target_std[indices] + target_mean[indices]
+        blended = source.lerp(transferred, alpha).clamp(0.0, 1.0)
+        selected = torch.rand((source.shape[0], 1, 1, 1), device=source.device) < probability
+        return torch.where(selected, blended, source)
+
     def preprocess_batch(self, batch):
         batch = super().preprocess_batch(batch)
         if self.dann_config['experiment'] == 'e0bn':
@@ -227,13 +286,38 @@ class DANNDetectionTrainer(DetectionTrainer):
             target_images = F.interpolate(
                 target_images, size=source_images.shape[2:], mode='bilinear', align_corners=False
             )
+        if self.dann_config['source_style_aug']:
+            source_images = self._target_style_source(
+                source_images,
+                target_images,
+                self.dann_config['source_style_prob'],
+                self.dann_config['source_style_alpha'],
+            )
+            batch['img'] = source_images
 
         total_steps = self.epochs * len(self.train_loader)
         progress = min(self._dann_step / max(total_steps - 1, 1), 1.0)
+        warmup_fraction = self.dann_config['warmup_fraction']
+        adversarial_progress = max(progress - warmup_fraction, 0.0) / (1.0 - warmup_fraction)
         batch['target_img'] = target_images
+        batch['target_supervised'] = self.dann_config['target_supervised']
+        if batch['target_supervised']:
+            source_batch_size = source_images.shape[0]
+            target_batch_indices = target_batch.get('batch_idx')
+            if not isinstance(target_batch_indices, torch.Tensor):
+                raise TypeError('supervised target batches must contain tensor batch_idx annotations')
+            for key in ('cls', 'bboxes'):
+                value = target_batch.get(key)
+                if not isinstance(value, torch.Tensor) or value.shape[0] != target_batch_indices.shape[0]:
+                    raise ValueError(f'supervised target annotation tensor {key} must align with batch_idx')
+            batch['batch_idx'] = torch.cat((batch['batch_idx'], target_batch_indices + source_batch_size))
+            batch['cls'] = torch.cat((batch['cls'], target_batch['cls']))
+            batch['bboxes'] = torch.cat((batch['bboxes'], target_batch['bboxes']))
         batch['dann_enabled'] = self.dann_config['experiment'] == 'e1'
         batch['dann_lambda'] = dann_lambda(
-            progress, lambda_max=self.dann_config['lambda_max'], gamma=self.dann_config['gamma']
+            adversarial_progress,
+            lambda_max=self.dann_config['lambda_max'],
+            gamma=self.dann_config['gamma'],
         )
         self._dann_step += 1
         return batch

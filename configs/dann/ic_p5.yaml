@@ -19,3 +19,4 @@ dann:
   domain_loss_gain: 1.0
   lambda_max: 1.0
   gamma: 10.0
+  warmup_fraction: 0.0
