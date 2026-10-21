@@ -1495,7 +1495,8 @@ class RandomRotate90:
 
         img = labels["img"]
         instances = labels.pop("instances")
-        instances.convert_bbox(format="xywh")
+        # The box formulas below are written for (left, top, width, height) boxes, not for centre-based xywh.
+        instances.convert_bbox(format="ltwh")
 
         h, w = img.shape[:2]
         hn = 1 if instances.normalized else h
@@ -1504,7 +1505,7 @@ class RandomRotate90:
         k = self.fixed_k if self.fixed_k is not None else random.choice([1, 2, 3])  # 90, 180, 270
         img = np.rot90(img, k)
 
-        # Rotate boxes (xywh in either absolute or normalized scale)
+        # Rotate boxes (ltwh in either absolute or normalized scale; cx, cy below are the left/top corner)
         cx, cy, bw, bh = (
             instances.bboxes[:, 0].copy(),
             instances.bboxes[:, 1].copy(),
@@ -1568,6 +1569,7 @@ class RandomRotate90:
             # After rotation, image shape becomes (w, h, 3)
             h, w = w, h
 
+        instances.convert_bbox(format="xywh")  # later transforms expect centre-based xywh, as before this fix
         labels["img"] = np.ascontiguousarray(img)
         labels["instances"] = instances
         return labels

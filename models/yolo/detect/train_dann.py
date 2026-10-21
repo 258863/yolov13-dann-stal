@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from copy import copy
 from numbers import Real
 
 import torch
@@ -11,7 +12,7 @@ from torch.nn import functional as F
 from ultralytics.data.utils import check_det_dataset
 from ultralytics.models.yolo.detect.dann import DANNDetectionModel, dann_lambda
 from ultralytics.models.yolo.detect.train import DetectionTrainer
-from ultralytics.utils import LOCAL_RANK, RANK
+from ultralytics.utils import LOCAL_RANK, LOGGER, RANK
 
 
 DEFAULT_DANN_CONFIG = {
@@ -216,6 +217,20 @@ class DANNDetectionTrainer(DetectionTrainer):
         self._target_iterator = iter(self.target_loader)
         self._target_epoch = None
         self._dann_step = self.start_epoch * len(self.train_loader)
+        if self.start_epoch > (self.epochs - self.args.close_mosaic):
+            self._close_target_mosaic()  # resumed after the Source loader already closed its mosaic
+
+    def _close_target_mosaic(self):
+        dataset = getattr(self.target_loader, 'dataset', None)
+        if hasattr(dataset, 'mosaic'):
+            dataset.mosaic = False
+        if hasattr(dataset, 'close_mosaic'):
+            LOGGER.info('Closing target dataloader mosaic')
+            dataset.close_mosaic(hyp=copy(self.args))
+
+    def _close_dataloader_mosaic(self):
+        super()._close_dataloader_mosaic()  # the base class only closes the Source train_loader
+        self._close_target_mosaic()
 
     def _reset_target_iterator(self) -> None:
         sampler = getattr(self.target_loader, 'sampler', None)

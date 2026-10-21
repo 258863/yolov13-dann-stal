@@ -957,3 +957,37 @@ def test_onnx_export_excludes_training_only_domain_branch(tmp_path: Path) -> Non
     node_names = [node.name.lower() for node in dann_graph.node]
     assert not any('domain_classifier' in name for name in initializer_names)
     assert not any('domain_classifier' in name or 'gradientreversal' in name for name in node_names)
+
+
+class FakeMosaicDataset:
+    def __init__(self) -> None:
+        self.mosaic = True
+        self.close_calls = []
+
+    def close_mosaic(self, hyp) -> None:
+        self.close_calls.append(hyp)
+
+
+def test_close_dataloader_mosaic_closes_source_and_target_loaders() -> None:
+    trainer = object.__new__(DANNDetectionTrainer)
+    trainer.args = SimpleNamespace(mosaic=1.0, close_mosaic=10)
+    trainer.train_loader = SimpleNamespace(dataset=FakeMosaicDataset())
+    trainer.target_loader = SimpleNamespace(dataset=FakeMosaicDataset())
+
+    trainer._close_dataloader_mosaic()
+
+    for loader in (trainer.train_loader, trainer.target_loader):
+        assert loader.dataset.mosaic is False
+        assert len(loader.dataset.close_calls) == 1
+
+
+def test_close_dataloader_mosaic_without_target_loader_only_closes_source() -> None:
+    trainer = object.__new__(DANNDetectionTrainer)
+    trainer.args = SimpleNamespace(mosaic=1.0, close_mosaic=10)
+    trainer.train_loader = SimpleNamespace(dataset=FakeMosaicDataset())
+    trainer.target_loader = None
+
+    trainer._close_dataloader_mosaic()
+
+    assert trainer.train_loader.dataset.mosaic is False
+    assert len(trainer.train_loader.dataset.close_calls) == 1
